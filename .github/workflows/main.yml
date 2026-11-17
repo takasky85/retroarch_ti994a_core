@@ -77,21 +77,22 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Android NDK
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r26b
-          add-to-path: true
+      - name: Setup Android NDK Path
+        run: |
+          # GitHub pre-installs the Android NDK on Linux runners under ANDROID_NDK_HOME
+          echo "Using pre-installed NDK at: $ANDROID_NDK_HOME"
+          echo "NDK_ROOT=$ANDROID_NDK_HOME" >> $GITHUB_ENV
 
       - name: Build Android Core
         run: |
           cd jni
-          ndk-build APP_ABI=${{ matrix.abi }}
+          # Use the pre-installed NDK's build tool directly
+          $ANDROID_NDK_HOME/ndk-build APP_ABI=${{ matrix.abi }}
 
       - name: Prepare Android Artifact
         run: |
           mkdir -p dist
-          cp libs/${{ matrix.abi }}/ti99_libretro.so dist/ti99_libretro-android-${{ matrix.abi }}.so
+          cp jni/libs/${{ matrix.abi }}/ti99_libretro.so dist/ti99_libretro-android-${{ matrix.abi }}.so
 
       - name: Upload Android Artifact
         uses: actions/upload-artifact@v4
