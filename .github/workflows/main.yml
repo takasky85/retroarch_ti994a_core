@@ -1,0 +1,94 @@
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'v*' # Automatically runs when a release tag (e.g., v1.0.0) is pushed
+  workflow_dispatch: # Enables the manual "Run workflow" button in the GitHub Actions UI
+    inputs:
+      release_tag:
+        description: 'Release tag to attach assets to (leave blank if running directly from a tag)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-desktop:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target_name: ti99_libretro.so
+            artifact_name: ti99_libretro-linux.so
+          - os: windows-latest
+            target_name: ti99_libretro.dll
+            artifact_name: ti99_libretro-windows.dll
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MinGW (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: make mingw-w64-x86_64-toolchain
+
+      - name: Build with Make (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update && sudo apt-get install -y build-essential
+          make
+
+      - name: Build with Make (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: msys2 {0}
+        run: |
+          make
+
+      - name: Prepare Artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp ${{ matrix.target_name }} dist/${{ matrix.artifact_name }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/*
+
+  build-android:
+    name: Build (Android - ${{ matrix.abi }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [armeabi-v7a, arm64-v8a, x86, x86_64]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v3
+        with:
+          ndk-version: r26b
+          add-to-path: true
+
+      - name: Build Android Core
+        run: |
+          cd jni
+          ndk-build APP_ABI=${{ matrix.abi }}
+
+      - name: Prepare Android Artifact
+        run: |
+          mkdir -p dist
+          cp libs/${{ matrix.abi }}/ti99_libretro.so dist/ti99_libretro
