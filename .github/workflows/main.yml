@@ -4,11 +4,12 @@ name: Build Release
 on:
   push:
     tags:
-      - "v*"
+      - 'v*'
+
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag (optional)"
+        description: 'Release tag to attach assets to (leave blank if running directly from a tag)'
         required: false
         type: string
 
@@ -16,8 +17,13 @@ permissions:
   contents: write
 
 jobs:
+
+  # ==========================================
+  # DESKTOP BUILDS
+  # ==========================================
+
   build-desktop:
-    name: Build Desktop (${{ matrix.os }})
+    name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -25,17 +31,18 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: ti99_libretro.so
-            artifact: ti99_libretro-linux.so
+            target_name: ti99_libretro.so
+            artifact_name: ti99_libretro-linux.so
+
           - os: windows-latest
-            target: ti99_libretro.dll
-            artifact: ti99_libretro-windows.dll
+            target_name: ti99_libretro.dll
+            artifact_name: ti99_libretro-windows.dll
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup MinGW
+      - name: Setup MinGW (Windows)
         if: matrix.os == 'windows-latest'
         uses: msys2/setup-msys2@v2
         with:
@@ -43,32 +50,37 @@ jobs:
           update: true
           install: make mingw-w64-x86_64-toolchain
 
-      - name: Build Linux
+      - name: Build with Make (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential
           make
 
-      - name: Build Windows
+      - name: Build with Make (Windows)
         if: matrix.os == 'windows-latest'
         shell: msys2 {0}
-        run: make
+        run: |
+          make
 
-      - name: Prepare Artifact
+      - name: Prepare Desktop Artifact
         shell: bash
         run: |
           mkdir -p dist
-          cp "${{ matrix.target }}" "dist/${{ matrix.artifact }}"
+          cp "${{ matrix.target_name }}" "dist/${{ matrix.artifact_name }}"
 
-      - name: Upload Artifact
+      - name: Upload Desktop Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
+          name: ${{ matrix.artifact_name }}
           path: dist/*
 
+  # ==========================================
+  # ANDROID BUILDS
+  # ==========================================
+
   build-android:
-    name: Build Android (${{ matrix.abi }})
+    name: Build (Android - ${{ matrix.abi }})
     runs-on: ubuntu-latest
 
     strategy:
@@ -81,20 +93,25 @@ jobs:
           - x86_64
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup NDK
+      - name: Setup Android NDK
         run: |
-          echo "NDK: $ANDROID_NDK_HOME"
+          echo "Using Android NDK: $ANDROID_NDK_HOME"
           echo "NDK_ROOT=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
 
-      - name: Build Android
+      - name: Build Android Core
         run: |
           cd jni
           "$ANDROID_NDK_HOME/ndk-build" APP_ABI=${{ matrix.abi }}
 
-      - name: Locate Android Library
+      - name: Show Android Build Output
+        run: |
+          echo "Searching for compiled libraries..."
+          find jni -type f -name "*.so" -print
+
+      - name: Prepare Android Artifact
         shell: bash
         run: |
           mkdir -p dist
@@ -104,17 +121,58 @@ jobs:
             -print -quit)
 
           if [ -z "$SO_FILE" ]; then
-            echo "ERROR: Library not found for ${{ matrix.abi }}"
-            find jni -type f -name "*.so"
+            echo "ERROR: Library not found for ABI: ${{ matrix.abi }}"
+            echo "Available shared libraries:"
+            find jni -type f -name "*.so" -print
             exit 1
           fi
 
-          echo "Found: $SO_FILE"
+          echo "Found library: $SO_FILE"
 
-          cp "$SO_FILE" "dist/ti99_libretro-android-${{ matrix.abi }}.so"
+          cp "$SO_FILE" \
+            "dist/ti99_libretro-android-${{ matrix.abi }}.so"
+
+          echo "Android artifact prepared successfully."
 
       - name: Upload Android Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ti99_libretro-android-${{ matrix.abi }}
-          path
+          path: dist/*
+
+  # ==========================================
+  # CREATE GITHUB RELEASE
+  # ==========================================
+
+  create-release:
+    name: Create GitHub Release
+    needs:
+      - build-desktop
+      - build-android
+
+    runs-on: ubuntu-latest
+
+    if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
+
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Display Downloaded Files
+        run: |
+          ls -R release-artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          files: |
+            release-artifacts/**/*.dll
+            release-artifacts/**/*.so
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
