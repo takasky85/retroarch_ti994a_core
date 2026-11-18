@@ -74,66 +74,6 @@ jobs:
           name: ${{ matrix.artifact_name }}
           path: dist/*
 
-  # ==========================================
-  # ANDROID BUILDS
-  # ==========================================
-
-  build-android:
-    name: Build (Android - ${{ matrix.abi }})
-    runs-on: ubuntu-latest
-
-    strategy:
-      fail-fast: false
-      matrix:
-        abi:
-          - armeabi-v7a
-          - arm64-v8a
-          - x86
-          - x86_64
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Android NDK
-        run: |
-          echo "Using Android NDK: $ANDROID_NDK_HOME"
-          echo "NDK_ROOT=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
-
-      - name: Build Android Core
-        run: |
-          "$ANDROID_NDK_HOME/ndk-build" \
-            NDK_PROJECT_PATH=. \
-            APP_BUILD_SCRIPT=jni/Android.mk \
-            NDK_APPLICATION_MK=jni/Application.mk \
-            APP_ABI=${{ matrix.abi }}
-
-      - name: Show Android Build Output
-        run: |
-          echo "Searching for compiled libraries..."
-          find jni -type f -name "*.so" -print
-
-      - name: Prepare Android Artifact
-        shell: bash
-        run: |
-          mkdir -p dist
-
-          SO_FILE="libs/${{ matrix.abi }}/ti99_libretro.so"
-
-          if [ ! -f "$SO_FILE" ]; then
-            echo "ERROR: Expected library not found: $SO_FILE"
-            echo "Searching for available libraries:"
-            find . -type f -name "*.so" -print
-            exit 1
-          fi
-
-          cp "$SO_FILE" "dist/ti99_libretro-android-${{ matrix.abi }}.so"
-
-      - name: Upload Android Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ti99_libretro-android-${{ matrix.abi }}
-          path: dist/*
 
   # ==========================================
   # CREATE GITHUB RELEASE
@@ -143,7 +83,6 @@ jobs:
     name: Create GitHub Release
     needs:
       - build-desktop
-      - build-android
 
     runs-on: ubuntu-latest
 
