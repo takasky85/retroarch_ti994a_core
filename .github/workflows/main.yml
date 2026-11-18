@@ -79,20 +79,19 @@ jobs:
 
       - name: Setup Android NDK Path
         run: |
-          # GitHub pre-installs the Android NDK on Linux runners under ANDROID_NDK_HOME
           echo "Using pre-installed NDK at: $ANDROID_NDK_HOME"
           echo "NDK_ROOT=$ANDROID_NDK_HOME" >> $GITHUB_ENV
 
       - name: Build Android Core
         run: |
           cd jni
-          # Use the pre-installed NDK's build tool directly
           $ANDROID_NDK_HOME/ndk-build APP_ABI=${{ matrix.abi }}
 
       - name: Prepare Android Artifact
         run: |
           mkdir -p dist
-          cp jni/libs/${{ matrix.abi }}/ti99_libretro.so dist/ti99_libretro-android-${{ matrix.abi }}.so
+          # ndk-build places 'libs' at the root repository level relative to jni/
+          cp libs/${{ matrix.abi }}/ti99_libretro.so dist/ti99_libretro-android-${{ matrix.abi }}.so
 
       - name: Upload Android Artifact
         uses: actions/upload-artifact@v4
