@@ -90,8 +90,8 @@ jobs:
       - name: Prepare Android Artifact
         run: |
           mkdir -p dist
-          # ndk-build places 'libs' at the root repository level relative to jni/
-          cp libs/${{ matrix.abi }}/ti99_libretro.so dist/ti99_libretro-android-${{ matrix.abi }}.so
+          # ndk-build outputs to 'libs/' at the repository root level (outside the jni folder)
+          cp ../libs/${{ matrix.abi }}/ti99_libretro.so dist/ti99_libretro-android-${{ matrix.abi }}.so
 
       - name: Upload Android Artifact
         uses: actions/upload-artifact@v4
