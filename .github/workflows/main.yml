@@ -102,8 +102,11 @@ jobs:
 
       - name: Build Android Core
         run: |
-          cd jni
-          "$ANDROID_NDK_HOME/ndk-build" APP_ABI=${{ matrix.abi }}
+          "$ANDROID_NDK_HOME/ndk-build" \
+            NDK_PROJECT_PATH=. \
+            APP_BUILD_SCRIPT=jni/Android.mk \
+            NDK_APPLICATION_MK=jni/Application.mk \
+            APP_ABI=${{ matrix.abi }}
 
       - name: Show Android Build Output
         run: |
@@ -115,23 +118,16 @@ jobs:
         run: |
           mkdir -p dist
 
-          SO_FILE=$(find jni -type f \
-            -path "*/${{ matrix.abi }}/ti99_libretro.so" \
-            -print -quit)
+          SO_FILE="libs/${{ matrix.abi }}/ti99_libretro.so"
 
-          if [ -z "$SO_FILE" ]; then
-            echo "ERROR: Library not found for ABI: ${{ matrix.abi }}"
-            echo "Available shared libraries:"
-            find jni -type f -name "*.so" -print
+          if [ ! -f "$SO_FILE" ]; then
+            echo "ERROR: Expected library not found: $SO_FILE"
+            echo "Searching for available libraries:"
+            find . -type f -name "*.so" -print
             exit 1
           fi
 
-          echo "Found library: $SO_FILE"
-
-          cp "$SO_FILE" \
-            "dist/ti99_libretro-android-${{ matrix.abi }}.so"
-
-          echo "Android artifact prepared successfully."
+          cp "$SO_FILE" "dist/ti99_libretro-android-${{ matrix.abi }}.so"
 
       - name: Upload Android Artifact
         uses: actions/upload-artifact@v4
