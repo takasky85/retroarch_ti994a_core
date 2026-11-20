@@ -14,6 +14,7 @@
 #include "loader.h"
 #include "speech.h"
 #include "osk.h"
+#include "picker.h"
 #include "keymatrix.h"
 
 static int g_fail = 0, g_checks = 0;
@@ -527,7 +528,8 @@ static void test_loader(void)
             "  <feature name=\"pcb\" value=\"paged12k\" /><dataarea name=\"rom_socket\" size=\"0x3000\">\n"
             "  <rom name=\"xb.bin\" size=\"0x3000\" offset=\"0\" /></dataarea></part></software>\n"
             "<software name=\"weird\"><part name=\"cart\" interface=\"ti99_cart\">\n"
-            "  <feature name=\"pcb\" value=\"super\" /><dataarea name=\"ram_socket\" size=\"0x8000\"/></part></software>\n"
+            "  <feature name=\"pcb\" value=\"super\" /><dataarea name=\"rom_socket\" size=\"0x2000\"><rom name=\"weird.bin\" size=\"16\" offset=\"0\"/></dataarea>"
+            "<dataarea name=\"ram_socket\" size=\"0x8000\"/></part></software>\n"
             "</softwarelist>\n";
         loaded_cart lc;
         zfile f[3];
@@ -561,8 +563,10 @@ static void test_loader(void)
         /* unknown cart type reports a clear error */
         f[0].name = "weird.bin"; f[0].data = xb1; f[0].size = 16;
         z = make_zip(f, 1, &zs);
-        CHECK(loader_load_cart("weird.zip", z, zs, sysdir, &lc, err, sizeof err) != 0);
-        CHECK(strstr(err, "not supported") != NULL);
+        CHECK_EQ(loader_load_cart("weird.zip", z, zs, sysdir, &lc, err, sizeof err), 0);
+        CHECK_EQ(lc.desc.type, CART_PAGED378);          /* unknown pcb: runs as a banked ROM ... */
+        CHECK_EQ(lc.guessed, 2);                         /* ... and the picker is offered */
+        loaded_cart_free(&lc);
         free(z);
 
         /* not in the softlist: heuristic by file suffix */
@@ -588,6 +592,218 @@ static void test_loader(void)
             CHECK_EQ(lc.desc.rom[0x2000 + 4], gB[4]); CHECK_EQ(lc.desc.ngrom, 1);
             loaded_cart_free(&lc); free(z);
         }
+    }
+}
+
+
+/* ============================ cartridge detection, bank switching, type picker */
+
+/* >AA header with one program named 'name' (program list at >600C, entry >6030) */
+static void mkhdr(uint8_t *img, const char *name)
+{
+    size_t i, l = strlen(name);
+    img[0] = 0xAA; img[1] = 0x01; img[2] = 0x01;
+    img[6] = 0x60; img[7] = 0x0C;
+    img[0x0C] = 0; img[0x0D] = 0; img[0x0E] = 0x60; img[0x0F] = 0x30; img[0x10] = (uint8_t)l;
+    for (i = 0; i < l; i++) img[0x11 + i] = (uint8_t)name[i];
+}
+
+static void fill_banks(uint8_t *img, unsigned nbanks)
+{
+    unsigned b, i;
+    for (b = 0; b < nbanks; b++)
+        for (i = 0x40; i < 0x2000; i++) img[b * 0x2000u + i] = (uint8_t)(b * 16u + (i & 15u) + 1u);
+}
+
+static void test_cart_detection(void)
+{
+    static uint8_t img64[0x10000], img16[0x4000], img12[12162], img12k[0x3000], grom8[0x2000], nohdr[0x4000];
+    loaded_cart lc;
+    char err[256];
+    size_t zs;
+    uint8_t *z;
+    zfile f[3];
+    ti99 *m;
+    printf("Cartridge detection / banking / picker\n");
+
+    /* --- raw 16K homebrew with a valid header (TI Invaders style, name ends in 8) */
+    memset(img16, 0, sizeof img16); mkhdr(img16, "TI INVADERS"); fill_banks(img16, 2);
+    CHECK_EQ(loader_load_cart("ti-inva.unlimited.8.bin", img16, sizeof img16, "/nonexistent", &lc, err, sizeof err), 0);
+    CHECK_EQ(lc.desc.type, CART_PAGED16K); CHECK_EQ(lc.desc.rom_size, 0x4000);
+    CHECK_EQ(lc.guessed, 1); CHECK(lc.header_ok); CHECK(!strcmp(lc.title, "TI INVADERS"));
+    CHECK_EQ(lc.detected, LCT_16K);
+    loaded_cart_free(&lc);
+
+    /* --- zip holding a readme and a 64K 8-bank image: the readme must not end up in the ROM, in either order */
+    memset(img64, 0, sizeof img64); mkhdr(img64, "MARIO BROS"); fill_banks(img64, 8);
+    {
+        static const uint8_t readme[] = "Mario Bros is a 64KB ROM. It requires 32KB memory expansion and joysticks.";
+        int order;
+        for (order = 0; order < 2; order++) {
+            f[order ? 1 : 0].name = "MarioBros.txt"; f[order ? 1 : 0].data = readme; f[order ? 1 : 0].size = sizeof readme;
+            f[order ? 0 : 1].name = "marioE8.bin";   f[order ? 0 : 1].data = img64; f[order ? 0 : 1].size = sizeof img64;
+            z = make_zip(f, 2, &zs);
+            CHECK_EQ(loader_load_cart("MarioBrosTI_E.zip", z, zs, "/nonexistent", &lc, err, sizeof err), 0);
+            CHECK_EQ(lc.desc.type, CART_PAGED378); CHECK_EQ(lc.desc.rom_size, 0x10000);
+            CHECK(!memcmp(lc.desc.rom, img64, sizeof img64));
+            CHECK_EQ(lc.guessed, 1); CHECK(!strcmp(lc.title, "MARIO BROS"));
+            loaded_cart_free(&lc); free(z);
+        }
+    }
+
+    /* --- 12162-byte image (sword8): two 8K banks, short last bank padded by the machine */
+    memset(img12, 0, sizeof img12); mkhdr(img12, "SWORD"); fill_banks(img12, 1);
+    {
+        unsigned i;
+        for (i = 0x2000; i < sizeof img12; i++) img12[i] = (uint8_t)(0x80 + (i & 0x3F));
+    }
+    f[0].name = "sword8.bin"; f[0].data = img12; f[0].size = sizeof img12;
+    z = make_zip(f, 1, &zs);
+    CHECK_EQ(loader_load_cart("sword_bin.zip", z, zs, "/nonexistent", &lc, err, sizeof err), 0);
+    CHECK_EQ(lc.desc.type, CART_PAGED16K); CHECK_EQ(lc.desc.rom_size, sizeof img12);
+    CHECK_EQ(lc.guessed, 1);                             /* 12162 is not an Extended BASIC image: no menu needed */
+    m = ti99_create(48000);
+    CHECK_EQ(ti99_insert_cart(m, &lc.desc), 0);
+    CHECK_EQ(ti99_peek16(m, 0x6000), 0xAA01);
+    ti99_poke_cart(m, 0x6002, 0);                        /* bank 1 */
+    CHECK_EQ(ti99_peek16(m, 0x6000), (uint16_t)((img12[0x2000] << 8) | img12[0x2001]));
+    CHECK_EQ(ti99_peek16(m, 0x6000 + 0x1000), 0);        /* past the end of the file: padding, not a wrap-around */
+    ti99_poke_cart(m, 0x6000, 0);                        /* back to bank 0 */
+    CHECK_EQ(ti99_peek16(m, 0x6000), 0xAA01);
+    ti99_destroy(m);
+    loaded_cart_free(&lc); free(z);
+
+    /* --- RPK with pcb gromemu: 64K banked ROM + 8K GROM */
+    memset(grom8, 0, sizeof grom8); grom8[0] = 0xAA; grom8[1] = 1; grom8[4] = 0x60; grom8[5] = 0x10;
+    {
+        const char *layout =
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?><romset version=\"1.0\"><resources>"
+            "<rom id=\"romimage\" file=\"lb99C.bin\"/><rom id=\"gromimage\" file=\"lb99G.bin\"/></resources>"
+            "<configuration><pcb type=\"gromemu\"><socket id=\"rom_socket\" uses=\"romimage\"/>"
+            "<socket id=\"grom_socket\" uses=\"gromimage\"/></pcb></configuration></romset>";
+        zfile r[3] = { { "layout.xml", (const uint8_t *)layout, (uint32_t)strlen(layout) },
+                       { "lb99C.bin", img64, sizeof img64 }, { "lb99G.bin", grom8, sizeof grom8 } };
+        z = make_zip(r, 3, &zs);
+        CHECK_EQ(loader_load_cart("lb99.rpk", z, zs, "/nonexistent", &lc, err, sizeof err), 0);
+        CHECK_EQ(lc.desc.type, CART_PAGED378); CHECK_EQ(lc.desc.rom_size, 0x10000);
+        CHECK_EQ(lc.desc.ngrom, 1); CHECK_EQ(lc.desc.grom[0].addr, 0x6000); CHECK_EQ(lc.desc.grom[0].size, 0x2000);
+        CHECK_EQ(lc.guessed, 0);
+        m = ti99_create(48000);
+        CHECK_EQ(ti99_insert_cart(m, &lc.desc), 0);
+        {
+            unsigned b;
+            for (b = 0; b < 8; b++) {            /* all 8 banks reachable: write >6000 + 2*bank */
+                ti99_poke_cart(m, (uint16_t)(0x6000u + 2u * b), 0);
+                CHECK_EQ(ti99_peek16(m, 0x6040), (uint16_t)((img64[b * 0x2000u + 0x40] << 8) | img64[b * 0x2000u + 0x41]));
+            }
+        }
+        ti99_destroy(m);
+        loaded_cart_free(&lc); free(z);
+    }
+
+    /* --- inverted order (379i) selected by hand: writing >6006 selects bank ~3 & 7 = 4 */
+    memset(nohdr, 0, sizeof nohdr);
+    CHECK_EQ(loader_load_cart_ex("x.bin", img64, sizeof img64, "/nonexistent", LCT_BANKED_INV, &lc, err, sizeof err), 0);
+    CHECK_EQ(lc.desc.type, CART_PAGED379I); CHECK_EQ(lc.detected, LCT_BANKED);
+    m = ti99_create(48000);
+    CHECK_EQ(ti99_insert_cart(m, &lc.desc), 0);
+    ti99_poke_cart(m, 0x6006, 0);
+    CHECK_EQ(ti99_peek16(m, 0x6040), (uint16_t)((img64[4 * 0x2000u + 0x40] << 8) | img64[4 * 0x2000u + 0x41]));
+    ti99_destroy(m);
+    loaded_cart_free(&lc);
+
+    /* --- override back and forth on a loaded cartridge */
+    CHECK_EQ(loader_load_cart("ti-inva.unlimited.8.bin", img16, sizeof img16, "/nonexistent", &lc, err, sizeof err), 0);
+    CHECK_EQ(loader_apply_type(&lc, LCT_MINIMEM), 0);
+    CHECK_EQ(lc.desc.type, CART_MINIMEM); CHECK_EQ(lc.desc.ram_size, 0x1000);
+    CHECK_EQ(loader_apply_type(&lc, LCT_STANDARD), 0);
+    CHECK_EQ(lc.desc.type, CART_STANDARD); CHECK_EQ(lc.desc.ram_size, 0);
+    CHECK_EQ(loader_apply_type(&lc, LCT_AUTO), 0);
+    CHECK_EQ(lc.desc.type, CART_PAGED16K);
+    loaded_cart_free(&lc);
+
+    /* --- when the core really cannot tell: no header, or exactly 12K (Extended BASIC layout?) */
+    memset(nohdr, 0x11, sizeof nohdr);
+    CHECK_EQ(loader_load_cart("mystery.bin", nohdr, sizeof nohdr, "/nonexistent", &lc, err, sizeof err), 0);
+    CHECK_EQ(lc.guessed, 2); CHECK(!lc.header_ok);
+    loaded_cart_free(&lc);
+    memset(img12k, 0, sizeof img12k); mkhdr(img12k, "XB LIKE");
+    CHECK_EQ(loader_load_cart("xblike.bin", img12k, sizeof img12k, "/nonexistent", &lc, err, sizeof err), 0);
+    CHECK_EQ(lc.guessed, 2); CHECK(lc.header_ok);
+    loaded_cart_free(&lc);
+    /* a plain 8K ROM is never a question */
+    CHECK_EQ(loader_load_cart("plain.bin", nohdr, 0x2000, "/nonexistent", &lc, err, sizeof err), 0);
+    CHECK_EQ(lc.guessed, 0); CHECK_EQ(lc.desc.type, CART_STANDARD);
+    loaded_cart_free(&lc);
+
+    /* --- names: c/d/g role letters only count with a digit before them or next to sibling files */
+    CHECK_EQ(loader_load_cart("sword.bin", img16, 0x2000, "/nonexistent", &lc, err, sizeof err), 0);
+    CHECK_EQ(lc.desc.rom_size, 0x2000); CHECK_EQ(lc.desc.ngrom, 0);     /* ends in 'd' but is one plain ROM */
+    loaded_cart_free(&lc);
+    CHECK_EQ(loader_load_cart("thing.g", grom8, sizeof grom8, "/nonexistent", &lc, err, sizeof err), 0);
+    CHECK_EQ(lc.desc.rom_size, 0); CHECK_EQ(lc.desc.ngrom, 1);
+    CHECK(lc.header_ok);                                                /* GROM header at >6000 is recognised too */
+    loaded_cart_free(&lc);
+
+    /* --- option names round-trip */
+    {
+        int i;
+        for (i = 0; i < LCT_COUNT; i++) CHECK_EQ(loader_type_from_option(loader_type_option(i)), i);
+        CHECK_EQ(loader_type_from_option("bogus"), LCT_AUTO);
+        CHECK_EQ(loader_type_from_option(NULL), LCT_AUTO);
+    }
+
+    /* --- picker */
+    {
+        picker p;
+        static uint32_t fb[OSK_W * OSK_H_PX];
+        int r, f2;
+        picker_init(&p);
+        CHECK(!picker_is_open(&p));
+        CHECK_EQ(picker_frame(&p, PICKER_OK), PICKER_NONE);          /* closed: ignores input */
+        picker_open(&p, LCT_16K);
+        CHECK(picker_is_open(&p)); CHECK_EQ(p.sel, LCT_16K);
+        CHECK_EQ(picker_frame(&p, PICKER_OK), PICKER_NONE);          /* a button still held from before must not choose */
+        CHECK(picker_is_open(&p));
+        CHECK_EQ(picker_frame(&p, 0), PICKER_NONE);
+        CHECK_EQ(picker_frame(&p, PICKER_DOWN), PICKER_NONE); CHECK_EQ(p.sel, LCT_BANKED);
+        CHECK_EQ(picker_frame(&p, PICKER_DOWN), PICKER_NONE); CHECK_EQ(p.sel, LCT_BANKED);   /* held: no double step */
+        for (f2 = 0; f2 < 40; f2++) picker_frame(&p, PICKER_DOWN);                           /* auto repeat */
+        CHECK(p.sel != LCT_BANKED);
+        picker_frame(&p, 0);
+        picker_open(&p, LCT_AUTO); picker_frame(&p, 0);
+        picker_frame(&p, PICKER_UP); CHECK_EQ(p.sel, LCT_COUNT - 1);                          /* wraps */
+        picker_frame(&p, 0);
+        picker_frame(&p, PICKER_DOWN); CHECK_EQ(p.sel, LCT_AUTO);
+        picker_frame(&p, 0);
+        picker_frame(&p, PICKER_DOWN); picker_frame(&p, 0); picker_frame(&p, PICKER_DOWN); picker_frame(&p, 0);
+        CHECK_EQ(p.sel, LCT_16K);
+        picker_draw(&p, fb, "ti-inva.unlimited.8.bin", "TI INVADERS", 16384, 1, LCT_16K);
+        { int lit = 0, k; for (k = 0; k < OSK_W * OSK_H_PX; k++) if (fb[k]) lit++; CHECK(lit > 5000); }
+        r = picker_frame(&p, PICKER_OK);
+        CHECK_EQ(r, LCT_16K); CHECK(!picker_is_open(&p));
+        picker_open(&p, LCT_BANKED); picker_frame(&p, 0);
+        CHECK_EQ(picker_frame(&p, PICKER_CANCEL), PICKER_CANCELLED); CHECK(!picker_is_open(&p));
+        picker_draw(&p, fb, "", "", 0, 0, LCT_AUTO);                 /* odd arguments must not crash */
+    }
+
+    /* --- the on-screen keyboard has a CART key that closes it and asks for the picker */
+    {
+        osk o;
+        int r, c, at = 0, found = 0;
+        uint8_t keys[8];
+        osk_init(&o);
+        for (r = 0; r < osk_row_count(); r++)
+            for (c = 0; c < osk_col_count(r); c++)
+                if (!strcmp(osk_label(r, c), "CART")) { found = 1; o.row = (uint8_t)r; o.col = (uint8_t)c; }
+        CHECK(found);
+        memset(keys, 0, 8); osk_frame(&o, OSK_TOGGLE, keys, &at);
+        memset(keys, 0, 8); osk_frame(&o, 0, keys, &at);
+        CHECK(osk_is_open(&o));
+        o.row = (uint8_t)(osk_row_count() - 1);
+        for (c = 0; c < osk_col_count(o.row); c++) if (!strcmp(osk_label(o.row, c), "CART")) o.col = (uint8_t)c;
+        memset(keys, 0, 8); osk_frame(&o, OSK_PRESS, keys, &at);
+        CHECK_EQ(at, 2); CHECK(!osk_is_open(&o));
     }
 }
 
@@ -1276,6 +1492,7 @@ int main(int argc, char **argv)
     test_speech_machine();
     test_speech_timing();
     test_osk();
+    test_cart_detection();
     printf("\n%d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

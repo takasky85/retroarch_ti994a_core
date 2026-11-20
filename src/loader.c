@@ -378,7 +378,9 @@ static int type_from_pcb(const char *s, builder *b)
     char t[64];
     snprintf(t, sizeof t, "%s", s);
     lower(t);
-    if (!strcmp(t, "standard") || !strcmp(t, "gromemu")) return CART_STANDARD;
+    if (!strcmp(t, "standard")) return CART_STANDARD;
+    /* gromemu: GROM + banked ROM (e.g. a 64K ROM with a GROM that starts it); same bank select as "paged" ROMs */
+    if (!strcmp(t, "gromemu")) return CART_PAGED378;
     if (!strcmp(t, "paged12k")) return CART_PAGED12K;
     if (!strcmp(t, "paged16k") || !strcmp(t, "paged")) return CART_PAGED16K;
     if (!strcmp(t, "paged379i")) return CART_PAGED379I;
@@ -386,8 +388,9 @@ static int type_from_pcb(const char *s, builder *b)
     if (!strcmp(t, "paged377")) return CART_PAGED377;
     if (!strcmp(t, "mbx")) return CART_MBX;
     if (!strcmp(t, "minimem")) return CART_MINIMEM;
+    /* paged7, super, ...: not emulated exactly; run it as a banked ROM and let the user pick another type */
     snprintf(b->unsupported, sizeof b->unsupported, "%s", t);
-    return CART_NONE;
+    return CART_PAGED378;
 }
 
 static int kind_from_area(const char *name, int *gidx)
@@ -412,10 +415,7 @@ static int finish(builder *b, loaded_cart *out, char *err, size_t errsz)
 {
     int i;
     uint32_t total = b->rom1_size + b->rom2_size;
-    if (!b->type) {
-        if (b->unsupported[0]) { seterr(err, errsz, "cartridge type '%s' is not supported yet", b->unsupported, 0); return -1; }
-        b->type = CART_STANDARD;
-    }
+    if (!b->type) b->type = CART_STANDARD;
     if (total) {
         out->rom = (uint8_t *)malloc(total);
         if (!out->rom) return -1;
@@ -563,25 +563,149 @@ static int load_from_rpk(const zip_archive *z, builder *b, char *err, size_t err
 
 /* ------------------------------------------------------------- heuristic */
 
-static int load_heuristic(const char *fname, const uint8_t *data, size_t size, builder *b)
+/* Files in a cartridge zip that are not ROM images (readmes, pictures, ...). */
+static int is_junk_name(const char *name)
 {
-    char base[128];
+    static const char *const junk[] = { "txt", "md", "nfo", "diz", "htm", "html", "pdf", "png", "jpg", "jpeg",
+                                        "gif", "bmp", "doc", "rtf", "ini", "cfg", "xml", "url", "zip", "7z", NULL };
+    char n[128];
+    const char *dot;
+    int i;
+    snprintf(n, sizeof n, "%s", name);
+    lower(n);
+    dot = strrchr(n, '.');
+    if (!dot) return 0;
+    for (i = 0; junk[i]; i++) if (!strcmp(dot + 1, junk[i])) return 1;
+    return 0;
+}
+
+/* multi = the zip holds several files, so a trailing c/d/g letter is a MAME-style role suffix */
+static int load_heuristic(const char *fname, const uint8_t *data, size_t size, builder *b, int multi)
+{
+    char base[128], ext[16];
     size_t l;
     const char *dot;
     int kind = K_ROM1, gidx = 1;
     snprintf(base, sizeof base, "%s", fname);
     lower(base);
     dot = strrchr(base, '.');
+    ext[0] = 0;
+    if (dot) snprintf(ext, sizeof ext, "%s", dot + 1);
     l = dot ? (size_t)(dot - base) : strlen(base);
     if (l >= 2 && base[l - 2] == 'g' && base[l - 1] >= '3' && base[l - 1] <= '9') {
         /* TI naming: phm3056g3.bin is the 6K GROM at >6000, g4 at >8000, g5 at >A000, g6 at >C000 */
         kind = K_GROM;
         gidx = base[l - 1] - '2';
-    } else if (l && base[l - 1] == 'g') kind = K_GROM;
-    else if (l && base[l - 1] == 'd') kind = K_ROM2;
-    else if (l && base[l - 1] == 'c') kind = K_ROM1;
-    else if (size > 0x2000u) kind = K_ROM1;
+    } else if (!strcmp(ext, "g")) kind = K_GROM;
+    else if (!strcmp(ext, "d")) kind = K_ROM2;
+    else if (!strcmp(ext, "c")) kind = K_ROM1;
+    else if (l >= 2 && (multi || isdigit((unsigned char)base[l - 2]))) {
+        if (base[l - 1] == 'g') kind = K_GROM;
+        else if (base[l - 1] == 'd') kind = K_ROM2;
+    }
     return bld_add(b, kind, gidx, data, size, 0);
+}
+
+/* Pick a cartridge type for ROM files nobody described. Returns 1 when it is only a guess. */
+static int guess_type(builder *b)
+{
+    if (b->rom2_size) { b->type = CART_PAGED16K; return 0; }            /* c.bin + d.bin */
+    if (b->rom1_size > 0x4000u) { b->type = CART_PAGED378; return 1; }  /* 32K/64K/... homebrew, 8K banks */
+    if (b->rom1_size > 0x2000u) { b->type = CART_PAGED16K; return 1; }  /* 12K/16K: two banks */
+    b->type = CART_STANDARD;
+    return 0;
+}
+
+/* Program names from the >AA header (program list at >6006) of the first ROM bank or the GROM at >6000. */
+static void describe_header(loaded_cart *c)
+{
+    const uint8_t *img = NULL;
+    uint32_t n = 0, ptr, hops;
+    char *o = c->title;
+    size_t left = sizeof c->title;
+    int i;
+    c->title[0] = 0;
+    c->header_ok = 0;
+    if (c->desc.rom_size >= 8 && c->desc.rom[0] == 0xAAu) { img = c->desc.rom; n = c->desc.rom_size; }
+    else {
+        for (i = 0; i < c->desc.ngrom; i++)
+            if (c->desc.grom[i].addr == 0x6000u && c->desc.grom[i].size >= 8 && c->desc.grom[i].data[0] == 0xAAu) {
+                img = c->desc.grom[i].data; n = c->desc.grom[i].size; break;
+            }
+    }
+    if (!img) return;
+    c->header_ok = 1;
+    if (n > 0x2000u) n = 0x2000u;
+    ptr = (uint32_t)((img[6] << 8) | img[7]);
+    for (hops = 0; hops < 6 && ptr >= 0x6000u && ptr + 5u < 0x6000u + n; hops++) {
+        uint32_t o0 = ptr - 0x6000u, len = img[o0 + 4], k;
+        if (len == 0 || len > 30 || o0 + 5u + len > n) break;
+        if (o != c->title && left > 3) { *o++ = ','; *o++ = ' '; left -= 2; }
+        for (k = 0; k < len && left > 1; k++) {
+            uint8_t ch = img[o0 + 5 + k];
+            *o++ = (char)((ch >= 32 && ch < 127) ? ch : '?');
+            left--;
+        }
+        *o = 0;
+        ptr = (uint32_t)((img[o0] << 8) | img[o0 + 1]);
+    }
+}
+
+static int lct_from_type(int type)
+{
+    switch (type) {
+    case CART_PAGED12K: return LCT_XB12K;
+    case CART_PAGED16K: return LCT_16K;
+    case CART_PAGED378: case CART_PAGED377: return LCT_BANKED;
+    case CART_PAGED379I: return LCT_BANKED_INV;
+    case CART_MBX: return LCT_MBX;
+    case CART_MINIMEM: return LCT_MINIMEM;
+    default: return LCT_STANDARD;
+    }
+}
+
+static int type_from_lct(int lct, int fallback)
+{
+    switch (lct) {
+    case LCT_STANDARD: return CART_STANDARD;
+    case LCT_16K: return CART_PAGED16K;
+    case LCT_BANKED: return CART_PAGED378;
+    case LCT_BANKED_INV: return CART_PAGED379I;
+    case LCT_XB12K: return CART_PAGED12K;
+    case LCT_MBX: return CART_MBX;
+    case LCT_MINIMEM: return CART_MINIMEM;
+    default: return fallback;
+    }
+}
+
+static const struct { const char *option, *label; } lct_names[LCT_COUNT] = {
+    { "auto",       "Automatic (detected)" },
+    { "standard",   "Standard 8K ROM + GROMs" },
+    { "16k",        "2 x 8K banks (16K)" },
+    { "banked",     "Banked ROM, 8K banks" },
+    { "banked_inv", "Banked ROM, inverted order" },
+    { "xb12k",      "Extended BASIC 12K" },
+    { "mbx",        "MBX (1K RAM + banks)" },
+    { "minimem",    "Mini Memory (4K RAM)" }
+};
+
+const char *loader_type_label(int lct) { return (lct >= 0 && lct < LCT_COUNT) ? lct_names[lct].label : "?"; }
+const char *loader_type_option(int lct) { return (lct >= 0 && lct < LCT_COUNT) ? lct_names[lct].option : "auto"; }
+int loader_type_from_option(const char *v)
+{
+    int i;
+    if (v) for (i = 0; i < LCT_COUNT; i++) if (!strcmp(v, lct_names[i].option)) return i;
+    return LCT_AUTO;
+}
+
+int loader_apply_type(loaded_cart *c, int lct)
+{
+    int t = type_from_lct(lct == LCT_AUTO ? c->detected : lct, CART_STANDARD);
+    c->desc.type = t;
+    c->desc.ram_size = 0;
+    if (t == CART_MINIMEM) c->desc.ram_size = 0x1000;
+    if (t == CART_MBX) c->desc.ram_size = 0x400;
+    return 0;
 }
 
 /* ----------------------------------------------------------------- public */
@@ -597,7 +721,14 @@ void loaded_cart_free(loaded_cart *c)
 int loader_load_cart(const char *path, const uint8_t *data, size_t size, const char *sysdir,
                      loaded_cart *out, char *err, size_t errsz)
 {
+    return loader_load_cart_ex(path, data, size, sysdir, LCT_AUTO, out, err, errsz);
+}
+
+int loader_load_cart_ex(const char *path, const uint8_t *data, size_t size, const char *sysdir, int force,
+                        loaded_cart *out, char *err, size_t errsz)
+{
     builder b;
+    int guessed = 0;
     char name[128], ext[16];
     const char *bn = path ? path : "", *p, *dot;
     int rc = -1;
@@ -649,13 +780,18 @@ int loader_load_cart(const char *path, const uint8_t *data, size_t size, const c
                 bld_free(&b);
                 memset(&b, 0, sizeof b);
                 rc = 0;
-                for (i = 0; i < z.count && rc == 0; i++) {
-                    size_t dn;
-                    uint8_t *d = zip_extract(&z, i, &dn);
-                    if (d) { rc = load_heuristic(z.entries[i].name, d, dn, &b); free(d); }
+                {
+                    int nfiles = 0;
+                    for (i = 0; i < z.count; i++) if (!is_junk_name(z.entries[i].name)) nfiles++;
+                    for (i = 0; i < z.count && rc == 0; i++) {
+                        size_t dn;
+                        uint8_t *d;
+                        if (is_junk_name(z.entries[i].name)) continue;
+                        d = zip_extract(&z, i, &dn);
+                        if (d) { rc = load_heuristic(z.entries[i].name, d, dn, &b, nfiles > 1); free(d); }
+                    }
                 }
-                if (b.rom2_size) b.type = CART_PAGED16K;
-                else if (b.rom1_size > 0x2000u) b.type = CART_PAGED16K;
+                guessed = guess_type(&b);
                 snprintf(out->note, sizeof out->note, "guessed layout from file names (%s)",
                          had_xml ? "not in the software lists" : "not in the built-in software list");
                 if (rc != 0) seterr(err, errsz, "could not read cartridge files", 0, 0);
@@ -663,14 +799,25 @@ int loader_load_cart(const char *path, const uint8_t *data, size_t size, const c
         }
         zip_close(&z);
     } else if (size) {
-        rc = load_heuristic(bn, data, size, &b);
+        rc = load_heuristic(bn, data, size, &b, 0);
         snprintf(out->note, sizeof out->note, "raw dump");
-        if (rc == 0 && b.rom1_size > 0x2000u) b.type = CART_PAGED16K;
+        if (rc == 0) guessed = guess_type(&b);
     } else {
         seterr(err, errsz, "empty content file", 0, 0);
     }
 
-    if (rc == 0) rc = finish(&b, out, err, errsz);
+    if (rc == 0) {
+        if (b.unsupported[0]) guessed = 1;
+        rc = finish(&b, out, err, errsz);
+    }
+    if (rc == 0) {
+        out->detected = lct_from_type(out->desc.type);
+        describe_header(out);
+        /* 0 = layout known, 1 = plausible guess (tell the user), 2 = really unsure (ask the user) */
+        out->guessed = guessed ? 1 : 0;
+        if (guessed && (!out->header_ok || b.unsupported[0] || out->desc.rom_size == 0x3000u)) out->guessed = 2;
+        if (force != LCT_AUTO) loader_apply_type(out, force);
+    }
     bld_free(&b);
     if (rc != 0) loaded_cart_free(out);
     return rc;

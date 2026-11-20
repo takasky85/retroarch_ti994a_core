@@ -10,7 +10,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 set(CORE_SOURCES
-  src/cpu9900.c src/vdp9918.c src/psg76489.c src/speech.c src/osk.c src/ti99.c
+  src/cpu9900.c src/vdp9918.c src/psg76489.c src/speech.c src/osk.c src/picker.c src/ti99.c
   src/zipread.c src/loader.c src/libretro_core.c)
 
 add_library(ti99_libretro SHARED ${CORE_SOURCES})
@@ -26,7 +26,7 @@ endif()
 
 # Tests
 enable_testing()
-add_executable(test_ti99 tests/test_main.c src/cpu9900.c src/vdp9918.c src/psg76489.c src/speech.c src/osk.c
+add_executable(test_ti99 tests/test_main.c src/cpu9900.c src/vdp9918.c src/psg76489.c src/speech.c src/osk.c src/picker.c
                src/ti99.c src/zipread.c src/loader.c)
 target_include_directories(test_ti99 PRIVATE src third_party/libretro)
 if(NOT MSVC)

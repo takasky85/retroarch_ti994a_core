@@ -47,6 +47,10 @@ static uint32_t first_pixels[16], bottom_row[256], top_row[256];
 static const char *option_speech = "enabled";
 static uint8_t pad_state[2][16];          /* [port][id] */
 static const char *option_expansion = "enabled";
+static const char *option_cart_type = "auto";
+static const char *option_cart_prompt = "enabled";
+static char last_msg[256];
+static uint32_t last_frame[256 * 192];
 static int g_need_fullpath;
 
 /* Behave like RetroArch: with need_fullpath the core gets only a path to a real file, otherwise a data buffer.
@@ -75,8 +79,13 @@ static bool env(unsigned cmd, void *data)
         struct retro_variable *v = data;
         if (!strcmp(v->key, "ti99_expansion")) { v->value = option_expansion; return true; }
         if (!strcmp(v->key, "ti99_speech")) { v->value = option_speech; return true; }
+        if (!strcmp(v->key, "ti99_cart_type")) { v->value = option_cart_type; return true; }
+        if (!strcmp(v->key, "ti99_cart_prompt")) { v->value = option_cart_prompt; return true; }
         return false; }
-    case RETRO_ENVIRONMENT_SET_MESSAGE: printf("  [core message] %s\n", ((struct retro_message *)data)->msg); return true;
+    case RETRO_ENVIRONMENT_SET_MESSAGE:
+        printf("  [core message] %s\n", ((struct retro_message *)data)->msg);
+        snprintf(last_msg, sizeof last_msg, "%s", ((struct retro_message *)data)->msg);
+        return true;
     case RETRO_ENVIRONMENT_SET_VARIABLES: case RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME:
     case RETRO_ENVIRONMENT_SET_CONTROLLER_INFO: case RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS: return true;
     default: return false;
@@ -87,7 +96,7 @@ static void video(const void *d, unsigned w, unsigned h, size_t pitch)
     frames_seen++; last_w = w; last_h = h;
     if (d && pitch == w * 4u) {
         memcpy(first_pixels, d, sizeof first_pixels);
-        if (w == 256 && h == 192) { memcpy(top_row, d, sizeof top_row); memcpy(bottom_row, (const uint32_t *)d + 191 * 256, sizeof bottom_row); }
+        if (w == 256 && h == 192) { memcpy(last_frame, d, sizeof last_frame); memcpy(top_row, d, sizeof top_row); memcpy(bottom_row, (const uint32_t *)d + 191 * 256, sizeof bottom_row); }
     }
 }
 static void audio_s(int16_t l, int16_t r) { (void)l; (void)r; }
@@ -408,6 +417,51 @@ int main(int argc, char **argv)
         CHECK(!c_load(&game));
         c_deinit();
         free(z);
+    }
+
+
+    /* ---- cartridge-type picker: an unrecognisable image pauses the machine and asks ---- */
+    {
+        static uint8_t big[0x4000];
+        size_t k;
+        unsigned lit;
+#define LIT() ((void)0); lit = 0; for (k = 0; k < 256u * 192u; k++) if (last_frame[k] & 0xFFFFFFu) lit++
+        memset(big, 0x11, sizeof big);                          /* no >AA header: the core cannot tell what it is */
+        option_cart_type = "auto"; option_cart_prompt = "enabled";
+        c_init();
+        CHECK(load_content("mystery.bin", big, sizeof big, 0));
+        frames(3);
+        LIT(); CHECK(lit > 3000);                               /* the menu is on screen */
+        pad_state[0][RETRO_DEVICE_ID_JOYPAD_DOWN] = 1; frames(1); pad_state[0][RETRO_DEVICE_ID_JOYPAD_DOWN] = 0; frames(1);
+        pad_state[0][RETRO_DEVICE_ID_JOYPAD_B] = 1; frames(1); pad_state[0][RETRO_DEVICE_ID_JOYPAD_B] = 0; frames(2);
+        CHECK(strstr(last_msg, "Banked ROM, 8K banks") != NULL);   /* the cursor starts on the detected type (2 x 8K); one DOWN = banked */
+        LIT(); CHECK(lit < 100);                                 /* menu gone, machine running */
+        key(1, RETROK_F10); frames(1); key(0, RETROK_F10); frames(2);
+        LIT(); CHECK(lit > 3000);                                /* F10 reopens it */
+        key(1, RETROK_ESCAPE); frames(1); key(0, RETROK_ESCAPE); frames(2);
+        LIT(); CHECK(lit < 100);                                 /* cancel keeps the running type */
+        c_unload(); c_deinit();
+
+        /* prompt disabled: no menu, just a note about the guess */
+        option_cart_prompt = "disabled"; last_msg[0] = 0;
+        c_init();
+        CHECK(load_content("mystery.bin", big, sizeof big, 0));
+        frames(3);
+        LIT(); CHECK(lit < 100);
+        CHECK(strstr(last_msg, "guessed cartridge type") != NULL);
+        c_unload(); c_deinit();
+
+        /* core option forces a type: no menu, no guess message */
+        option_cart_prompt = "enabled"; option_cart_type = "banked_inv"; last_msg[0] = 0;
+        c_init();
+        CHECK(load_content("mystery.bin", big, sizeof big, 0));
+        frames(3);
+        LIT(); CHECK(lit < 100);
+        CHECK(strstr(last_msg, "guessed") == NULL);
+        option_cart_type = "16k"; c_reset(); frames(1);          /* changed option applies on the next restart */
+        CHECK(strstr(last_msg, "2 x 8K banks") != NULL);
+        c_unload(); c_deinit();
+        option_cart_type = "auto";
     }
 
     /* optional: real cartridge zips given on the command line (host_test core.so bench|- zip...) */

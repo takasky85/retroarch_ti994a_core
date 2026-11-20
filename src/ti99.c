@@ -387,10 +387,20 @@ int ti99_insert_cart(ti99 *m, const ti99_cart_desc *d)
     ti99_remove_cart(m);
     m->cart_type = d->type;
     if (d->rom_size) {
-        m->cart_rom = (uint8_t *)malloc(d->rom_size + 2u);
+        /* Banked images are padded (with 0) to a power-of-two number of 8K banks so that a short
+         * last bank, or a 12K homebrew image, still has a full bank to switch to. */
+        uint32_t sz = d->rom_size;
+        if (d->type == CART_PAGED16K || d->type == CART_PAGED379I || d->type == CART_PAGED378 ||
+            d->type == CART_PAGED377 || d->type == CART_MBX) {
+            uint32_t banks = 1;
+            while (banks * 0x2000u < sz && banks < 256u) banks <<= 1;
+            if (d->type == CART_PAGED16K && banks < 2u) banks = 2u;
+            if (banks * 0x2000u > sz) sz = banks * 0x2000u;
+        }
+        m->cart_rom = (uint8_t *)calloc(sz + 2u, 1);
         if (!m->cart_rom) { m->cart_type = CART_NONE; return -1; }
         memcpy(m->cart_rom, d->rom, d->rom_size);
-        m->cart_rom_size = d->rom_size;
+        m->cart_rom_size = sz;
     }
     for (i = 0; i < d->ngrom; i++) {
         const ti99_blob *b = &d->grom[i];
@@ -516,7 +526,13 @@ uint16_t ti99_peek16(ti99 *m, uint16_t addr)
     if (addr >= 0x8000u && addr < 0x8400u) return bus_read(m, (uint16_t)(addr & 0xFFFEu));
     if (addr >= 0x2000u && addr < 0x4000u && m->expansion) return bus_read(m, (uint16_t)(addr & 0xFFFEu));
     if (addr >= 0xA000u && m->expansion) return bus_read(m, (uint16_t)(addr & 0xFFFEu));
+    if (addr >= 0x6000u && addr < 0x8000u) return cart_read(m, (uint16_t)(addr & 0xFFFEu));
     return 0;
+}
+
+void ti99_poke_cart(ti99 *m, uint16_t addr, uint16_t v)
+{
+    if (addr >= 0x6000u && addr < 0x8000u) cart_write(m, (uint16_t)(addr & 0xFFFEu), v);
 }
 
 void *ti99_cpu(ti99 *m) { return &m->cpu; }

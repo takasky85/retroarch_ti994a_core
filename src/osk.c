@@ -3,7 +3,7 @@
 #include "osk.h"
 #include "keymatrix.h"
 
-enum { KT_NORMAL, KT_SHIFT, KT_CTRL, KT_FCTN, KT_CAPS };
+enum { KT_NORMAL, KT_SHIFT, KT_CTRL, KT_FCTN, KT_CAPS, KT_CART };
 
 typedef struct {
     const char *label;
@@ -31,7 +31,7 @@ static const okey row4[] = { { "CAPS", 0, 0, KT_CAPS, 4 }, { "CTRL", 0, 0, KT_CT
 /* arrows are drawn from the glyphs \x01 (left) \x02 (right) \x03 (up) \x04 (down) */
 static const okey row5[] = { FK("QUIT", K_EQ, 3), FK("BACK", K_9, 3), FK("CLR", K_4, 2), FK("DEL", K_1, 2),
                              FK("INS", K_2, 2), FK("\x01", K_S, 2), FK("\x02", K_D, 2), FK("\x03", K_E, 2),
-                             FK("\x04", K_X, 2) };
+                             FK("\x04", K_X, 2), { "CART", 0, 0, KT_CART, 3 } };
 
 typedef struct { const okey *k; int n; } orow;
 static const orow rows[OSK_MAX_ROWS] = {
@@ -162,6 +162,7 @@ void osk_frame(osk *o, unsigned buttons, uint8_t keys[8], int *alpha_toggle)
         case KT_CTRL:  o->mods[1] = (uint8_t)((o->mods[1] + 1u) % 3u); break;
         case KT_FCTN:  o->mods[2] = (uint8_t)((o->mods[2] + 1u) % 3u); break;
         case KT_CAPS:  *alpha_toggle = 1; break;
+        case KT_CART:  *alpha_toggle = 2; o->open = 0; release_all(o); return;   /* cartridge-type picker */
         default:
             o->pressed_row = (int8_t)o->row;
             o->pressed_col = (int8_t)o->col;
@@ -221,6 +222,11 @@ static const uint8_t *glyph(char c)
     static const uint8_t comma[7] = { 0x00,0x00,0x00,0x00,0x0C,0x04,0x08 };
     static const uint8_t dot[7]   = { 0x00,0x00,0x00,0x00,0x00,0x0C,0x0C };
     static const uint8_t colon[7] = { 0x00,0x0C,0x0C,0x00,0x0C,0x0C,0x00 };
+    static const uint8_t minus[7] = { 0x00,0x00,0x00,0x1F,0x00,0x00,0x00 };
+    static const uint8_t plus[7]  = { 0x00,0x04,0x04,0x1F,0x04,0x04,0x00 };
+    static const uint8_t lpar[7]  = { 0x02,0x04,0x08,0x08,0x08,0x04,0x02 };
+    static const uint8_t rpar[7]  = { 0x08,0x04,0x02,0x02,0x02,0x04,0x08 };
+    static const uint8_t gt[7]    = { 0x08,0x04,0x02,0x01,0x02,0x04,0x08 };
     static const uint8_t larr[7]  = { 0x00,0x04,0x08,0x1F,0x08,0x04,0x00 };
     static const uint8_t rarr[7]  = { 0x00,0x04,0x02,0x1F,0x02,0x04,0x00 };
     static const uint8_t uarr[7]  = { 0x04,0x0E,0x15,0x04,0x04,0x04,0x04 };
@@ -231,6 +237,7 @@ static const uint8_t *glyph(char c)
     switch (c) {
     case '=': return eq;   case '/': return slash; case ';': return semi;  case ',': return comma;
     case '.': return dot;  case ':': return colon;
+    case '-': return minus; case '+': return plus; case '(': return lpar; case ')': return rpar; case '>': return gt;
     case '\x01': return larr; case '\x02': return rarr; case '\x03': return uarr; case '\x04': return darr;
     default: return blank;
     }
@@ -271,6 +278,16 @@ static void draw_text(uint32_t *fb, int x, int y, const char *s, uint32_t c)
             for (b = 0; b < 5; b++)
                 if (g[r] & (0x10u >> b)) put_px(fb, x + b, y + r, c);
     }
+}
+
+/* helpers shared with the cartridge picker */
+int  osk_text_width(const char *s) { return text_width(s); }
+void osk_draw_text(uint32_t *fb, int x, int y, const char *s, uint32_t c) { draw_text(fb, x, y, s, c); }
+void osk_fill_rect(uint32_t *fb, int x0, int y0, int x1, int y1, uint32_t c) { fill_rect(fb, x0, y0, x1, y1, c); }
+void osk_shade_rect(uint32_t *fb, int x0, int y0, int x1, int y1, uint32_t c, int a)
+{
+    int x, y;
+    for (y = y0; y < y1; y++) for (x = x0; x < x1; x++) blend_px(fb, x, y, c, a);
 }
 
 void osk_draw(const osk *o, uint32_t *fb, int alpha_lock)

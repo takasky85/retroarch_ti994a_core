@@ -1,0 +1,11 @@
+*.o
+*.so
+*.dll
+*.dylib
+test_ti99
+host_test
+tests/deflate_test.zip
+libs/
+obj/
+pkg/
+dist/

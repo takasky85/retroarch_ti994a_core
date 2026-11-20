@@ -45,11 +45,18 @@ void osk_init(osk *o);
 int  osk_is_open(const osk *o);
 
 /* Advance one frame.  'buttons' = OSK_* bits for this frame.  ORs the pressed keys into keys[8]
- * (TI matrix, columns 0-5).  *alpha_toggle is set to 1 if the CAPS key was pressed this frame. */
+ * (TI matrix, columns 0-5).  *alpha_toggle is set to 1 if the CAPS key was pressed this frame, or to 2
+ * if the CART key was pressed (the keyboard closes itself; the front end opens the cartridge picker). */
 void osk_frame(osk *o, unsigned buttons, uint8_t keys[8], int *alpha_toggle);
 
 /* Draw over fb (OSK_W x OSK_H_PX, XRGB8888).  alpha_lock lights the CAPS key. */
 void osk_draw(const osk *o, uint32_t *fb, int alpha_lock);
+
+/* Small drawing helpers (5x7 font, XRGB8888, OSK_W x OSK_H_PX) reused by the cartridge picker. */
+int  osk_text_width(const char *s);
+void osk_draw_text(uint32_t *fb, int x, int y, const char *s, uint32_t color);
+void osk_fill_rect(uint32_t *fb, int x0, int y0, int x1, int y1, uint32_t color);
+void osk_shade_rect(uint32_t *fb, int x0, int y0, int x1, int y1, uint32_t color, int alpha256);
 
 /* Introspection for tests. */
 int         osk_row_count(void);

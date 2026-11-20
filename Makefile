@@ -7,7 +7,7 @@
 CC      ?= gcc
 CFLAGS  ?= -O2
 CFLAGS  += -std=gnu99 -Wall -Wextra -fvisibility=hidden -Ithird_party/libretro -Isrc
-SRC      = src/cpu9900.c src/vdp9918.c src/psg76489.c src/speech.c src/osk.c src/ti99.c src/zipread.c src/loader.c src/libretro_core.c
+SRC      = src/cpu9900.c src/vdp9918.c src/psg76489.c src/speech.c src/osk.c src/picker.c src/ti99.c src/zipread.c src/loader.c src/libretro_core.c
 OBJ      = $(SRC:.c=.o)
 
 ifeq ($(OS),Windows_NT)
@@ -31,7 +31,7 @@ $(TARGET): $(OBJ)
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-TESTSRC = tests/test_main.c src/cpu9900.c src/vdp9918.c src/psg76489.c src/speech.c src/osk.c src/ti99.c src/zipread.c src/loader.c
+TESTSRC = tests/test_main.c src/cpu9900.c src/vdp9918.c src/psg76489.c src/speech.c src/osk.c src/picker.c src/ti99.c src/zipread.c src/loader.c
 
 test_ti99: $(TESTSRC)
 	$(CC) -std=gnu99 -g -O1 -Wall -Wextra -Isrc -Ithird_party/libretro $(TESTSRC) -lm -o $@

@@ -73,6 +73,7 @@ int    ti99_load_state(ti99 *m, const void *buf, size_t size);
 
 /* Test hooks */
 uint16_t ti99_peek16(ti99 *m, uint16_t addr);
+void     ti99_poke_cart(ti99 *m, uint16_t addr, uint16_t v);   /* write into >6000-7FFF (bank switching) */
 void     ti99_run_cycles(ti99 *m, int cycles);
 void    *ti99_cpu(ti99 *m);
 vdp9918 *ti99_vdp(ti99 *m);

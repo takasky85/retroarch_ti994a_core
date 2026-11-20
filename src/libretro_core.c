@@ -10,9 +10,10 @@
 #include "keymatrix.h"
 #include "speech.h"
 #include "osk.h"
+#include "picker.h"
 
 #define CORE_NAME    "TI-99/4A"
-#define CORE_VERSION "0.2.1"
+#define CORE_VERSION "0.3.0"
 #define SAMPLE_RATE  48000
 
 /* ------------------------------------------------------------ callbacks */
@@ -34,6 +35,15 @@ static uint8_t speech_rom[SPEECH_ROM_SIZE];
 static osk     keyboard;                    /* on-screen keyboard */
 static uint32_t osk_fb[VDP_WIDTH * VDP_HEIGHT];
 static uint8_t osk_key_request;             /* physical F11 pressed */
+static picker  cart_picker;                 /* cartridge-type menu */
+static uint8_t picker_key_request;          /* physical F10 pressed */
+static uint8_t picker_request;              /* open the picker at the start of the next frame */
+static loaded_cart cur_cart;                /* the loaded cartridge (kept so its type can be changed) */
+static int     cur_cart_valid;
+static int     cur_lct;                     /* LCT_* in effect */
+static int     opt_lct_applied;             /* value of ti99_cart_type when the cartridge was last mapped */
+static char    cur_cart_name[128];
+static int16_t silence_buf[TI99_MAX_AUDIO_FRAMES * 2];
 
 static void logmsg(enum retro_log_level lvl, const char *fmt, ...)
 {
@@ -115,6 +125,7 @@ static void keyboard_event(bool down, unsigned keycode, uint32_t character, uint
     if (keycode >= NKEYS) return;
     if (keycode == RETROK_CAPSLOCK) { if (down) alpha_lock ^= 1u; return; }
     if (keycode == RETROK_F11) { if (down) osk_key_request = 1; return; }
+    if (keycode == RETROK_F10) { if (down) picker_key_request = 1; return; }
     held[keycode] = down ? 1u : 0u;
 }
 
@@ -129,6 +140,7 @@ static void poll_input(uint8_t keys[8])
 
     memset(keys, 0, 8);
     input_poll_cb();
+    if (picker_is_open(&cart_picker)) return;          /* the menu owns the input; step_picker() reads it */
 
     shift = held[RETROK_LSHIFT] || held[RETROK_RSHIFT];
     ctrl  = held[RETROK_LCTRL]  || held[RETROK_RCTRL];
@@ -165,7 +177,9 @@ static void poll_input(uint8_t keys[8])
         if (pad(0, RETRO_DEVICE_ID_JOYPAD_SELECT) || osk_key_request) ob |= OSK_TOGGLE;
         osk_key_request = 0;
         osk_frame(&keyboard, ob, keys, &alpha_toggle);
-        if (alpha_toggle) alpha_lock ^= 1u;
+        if (alpha_toggle & 1) alpha_lock ^= 1u;
+        if (alpha_toggle & 2) picker_request = 1;          /* CART key on the on-screen keyboard */
+        if (picker_key_request) { picker_request = 1; picker_key_request = 0; }
     }
 
     if (!osk_is_open(&keyboard)) {
@@ -210,6 +224,54 @@ static void poll_input(uint8_t keys[8])
     if (ctrl) setkey(keys, K_CTRL);
 }
 
+
+/* ------------------------------------------------------ cartridge type */
+
+static int get_option_lct(void)
+{
+    struct retro_variable v;
+    v.key = "ti99_cart_type"; v.value = NULL;
+    if (env_cb && env_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &v) && v.value) return loader_type_from_option(v.value);
+    return LCT_AUTO;
+}
+
+/* Map the loaded cartridge as 'lct' and restart the machine. */
+static void remap_cart(int lct)
+{
+    char msg[160];
+    if (!machine || !cur_cart_valid) return;
+    loader_apply_type(&cur_cart, lct);
+    if (ti99_insert_cart(machine, &cur_cart.desc) != 0) { logmsg(RETRO_LOG_ERROR, "out of memory remapping cartridge"); return; }
+    cur_lct = (lct == LCT_AUTO) ? cur_cart.detected : lct;
+    ti99_reset(machine);
+    snprintf(msg, sizeof msg, "TI-99: cartridge type: %s", loader_type_label(cur_lct));
+    show_message(msg, 240);
+    logmsg(RETRO_LOG_INFO, "%s", msg);
+}
+
+static void open_picker(void)
+{
+    if (!cur_cart_valid) { show_message("TI-99: no cartridge loaded", 180); return; }
+    picker_open(&cart_picker, cur_lct);
+}
+
+/* One frame of the picker; returns 1 while it is open (emulation paused). */
+static int step_picker(void)
+{
+    unsigned b = 0;
+    int r;
+    int16_t ly;
+    if (!picker_is_open(&cart_picker)) return 0;
+    ly = input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y);
+    if (pad(0, RETRO_DEVICE_ID_JOYPAD_UP)   || ly < -0x4000 || held[RETROK_UP])   b |= PICKER_UP;
+    if (pad(0, RETRO_DEVICE_ID_JOYPAD_DOWN) || ly >  0x4000 || held[RETROK_DOWN]) b |= PICKER_DOWN;
+    if (pad(0, RETRO_DEVICE_ID_JOYPAD_B) || pad(0, RETRO_DEVICE_ID_JOYPAD_START) || held[RETROK_RETURN]) b |= PICKER_OK;
+    if (pad(0, RETRO_DEVICE_ID_JOYPAD_A) || pad(0, RETRO_DEVICE_ID_JOYPAD_SELECT) || held[RETROK_ESCAPE]) b |= PICKER_CANCEL;
+    r = picker_frame(&cart_picker, b);
+    if (r >= 0) remap_cart(r);
+    return picker_is_open(&cart_picker);
+}
+
 /* -------------------------------------------------------------- options */
 
 static int get_option_int(const char *key, const char *match, int if_match, int otherwise)
@@ -248,6 +310,8 @@ void retro_set_environment(retro_environment_t cb)
         { "ti99_expansion",    "32K RAM expansion (restart required); enabled|disabled" },
         { "ti99_sprite_limit", "Sprites per scanline; 4 (original hardware)|32 (no flicker)" },
         { "ti99_speech",       "Speech synthesizer (needs ti99_speech.zip); enabled|disabled" },
+        { "ti99_cart_type",    "Cartridge type (applied on restart); auto|standard|16k|banked|banked_inv|xb12k|mbx|minimem" },
+        { "ti99_cart_prompt",  "Ask for the cartridge type when unsure; enabled|disabled" },
         { NULL, NULL }
     };
     static const struct retro_controller_description pads[] = {
@@ -358,6 +422,9 @@ bool retro_load_game(const struct retro_game_info *game)
     alpha_lock = 0;
     osk_init(&keyboard);
     osk_key_request = 0;
+    picker_init(&cart_picker);
+    picker_key_request = picker_request = 0;
+    if (cur_cart_valid) { loaded_cart_free(&cur_cart); cur_cart_valid = 0; }
 
     content_dir[0] = 0;
     if (game && game->path) {
@@ -409,7 +476,8 @@ bool retro_load_game(const struct retro_game_info *game)
             }
             cdata = owned;
         }
-        if (loader_load_cart(game->path, cdata, csize, system_dir, &lc, err, sizeof err) != 0) {
+        opt_lct_applied = get_option_lct();
+        if (loader_load_cart_ex(game->path, cdata, csize, system_dir, opt_lct_applied, &lc, err, sizeof err) != 0) {
             free(owned);
             logmsg(RETRO_LOG_ERROR, "cartridge: %s", err);
             show_message(err, 600);
@@ -421,11 +489,27 @@ bool retro_load_game(const struct retro_game_info *game)
             logmsg(RETRO_LOG_ERROR, "out of memory loading cartridge");
             return false;
         }
-        logmsg(RETRO_LOG_INFO, "cartridge loaded: type %d, ROM %lu bytes, %d GROM block(s), %s",
-               lc.desc.type, (unsigned long)lc.desc.rom_size, lc.desc.ngrom, lc.note);
-        if (strncmp(lc.note, "guessed", 7) == 0)
-            show_message("TI-99: cartridge not in the MAME software list; layout guessed from file names", 480);
-        loaded_cart_free(&lc);
+        logmsg(RETRO_LOG_INFO, "cartridge loaded: type %d, ROM %lu bytes, %d GROM block(s), %s%s%s",
+               lc.desc.type, (unsigned long)lc.desc.rom_size, lc.desc.ngrom, lc.note,
+               lc.title[0] ? ", header: " : "", lc.title);
+        cur_cart = lc;                                  /* keep it: the picker can change its type */
+        cur_cart_valid = 1;
+        cur_lct = (opt_lct_applied == LCT_AUTO) ? lc.detected : opt_lct_applied;
+        {
+            const char *p, *bn = game->path ? game->path : "";
+            for (p = bn; *p; p++) if (*p == '/' || *p == '\\') bn = p + 1;
+            snprintf(cur_cart_name, sizeof cur_cart_name, "%s", bn);
+        }
+        if (opt_lct_applied == LCT_AUTO && lc.guessed) {
+            if (lc.guessed >= 2 && get_option_int("ti99_cart_prompt", "disabled", 0, 1)) {
+                open_picker();                          /* really unsure: ask before starting */
+            } else {
+                char msg[160];
+                snprintf(msg, sizeof msg, "TI-99: guessed cartridge type: %s (keyboard > CART or F10 to change)",
+                         loader_type_label(cur_lct));
+                show_message(msg, 420);
+            }
+        }
     } else {
         logmsg(RETRO_LOG_INFO, "starting without a cartridge");
     }
@@ -444,11 +528,18 @@ bool retro_load_game_special(unsigned type, const struct retro_game_info *info, 
 void retro_unload_game(void)
 {
     if (machine) ti99_remove_cart(machine);
+    if (cur_cart_valid) { loaded_cart_free(&cur_cart); cur_cart_valid = 0; }
+    picker_init(&cart_picker);
 }
 
 void retro_reset(void)
 {
-    if (machine && console_loaded) { apply_options(); ti99_reset(machine); }
+    if (machine && console_loaded) {
+        int want = get_option_lct();
+        apply_options();
+        if (cur_cart_valid && want != opt_lct_applied) { opt_lct_applied = want; remap_cart(want); return; }   /* also resets */
+        ti99_reset(machine);
+    }
 }
 
 void retro_run(void)
@@ -460,6 +551,20 @@ void retro_run(void)
     if (!machine || !console_loaded) return;
     if (env_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated) apply_live_options();
     poll_input(keys);
+    if (picker_request) { picker_request = 0; open_picker(); }
+    if (picker_is_open(&cart_picker)) {
+        /* menu is modal: the machine is paused, the picture is the last frame under a dimmed menu */
+        step_picker();
+        if (picker_is_open(&cart_picker)) {
+            memcpy(osk_fb, ti99_framebuffer(machine), sizeof osk_fb);
+            picker_draw(&cart_picker, osk_fb, cur_cart_name, cur_cart.title, (unsigned)cur_cart.desc.rom_size,
+                        cur_cart.header_ok, cur_cart.detected);
+            video_cb(osk_fb, VDP_WIDTH, VDP_HEIGHT, VDP_WIDTH * sizeof(uint32_t));
+            audio_batch_cb(silence_buf, 800);
+            return;
+        }
+        poll_input(keys);                               /* menu just closed: fresh keys for this frame */
+    }
     ti99_set_keys(machine, keys, alpha_lock);
     ti99_run_frame(machine, audio_buf, &n);
     if (osk_is_open(&keyboard)) {
